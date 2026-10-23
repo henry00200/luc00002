@@ -1,1 +1,23 @@
-
+{
+  "$schema": "https://schema.railpack.com",
+  "deploy": {
+    "aptPackages": [
+      "...",
+      "ca-certificates",
+      "tzdata"
+    ],
+    "variables": {
+      "PORT": "8080",
+      "TZ": "UTC",
+      "GOGC": "100",
+      "GODEBUG": "madvdontneed=1",
+      "BERMUDA_PATH_XH": "/api/v1/sync",
+      "BERMUDA_PATH_WS": "/api/v1/live",
+      "BERMUDA_PATH_TR": "/api/v1/gateway",
+      "BERMUDA_HEALTH_PATH": "/.well-known/hc-5b1e7c",
+      "BERMUDA_BACKEND_XH": "127.0.0.1:18443",
+      "BERMUDA_BACKEND_WS": "127.0.0.1:18444",
+      "BERMUDA_BACKEND_TR": "127.0.0.1:18445"
+    }
+  }
+}
