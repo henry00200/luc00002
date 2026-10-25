@@ -18,6 +18,7 @@ import (
 
 const (
 	lucityGraphQLEndpoint    = "https://lucity.cloud/graphql"
+	defaultLCCNAMETarget     = "lb.lucity.app"
 	defaultLCReqTimeout      = 15 * time.Second
 	defaultLCCertPollTick    = 5 * time.Second
 	defaultLCCertPollWait    = 90 * time.Second
@@ -25,6 +26,25 @@ const (
 	defaultLCTargetPort      = 8080
 	defaultLCBootstrapRegion = "eu-central"
 )
+
+var multiPartPublicSuffixes = []string{
+	".dpdns.org",
+	".qzz.io",
+	".us.kg",
+	".xx.kg",
+	".qd.je",
+	".co.uk",
+	".org.uk",
+	".ac.uk",
+	".gov.uk",
+	".com.au",
+	".net.au",
+	".org.au",
+	".co.jp",
+	".com.br",
+	".com.tr",
+	".co.in",
+}
 
 type lcAuthHeaderMode int
 
@@ -131,16 +151,53 @@ func (info *LucityCustomDomainInfo) IsCertificateValid() bool {
 		return false
 	}
 	st := strings.ToUpper(strings.TrimSpace(info.CertificateStatus))
+	if st == "" ||
+		strings.Contains(st, "PROVISION") ||
+		strings.Contains(st, "PENDING") ||
+		strings.Contains(st, "VALIDATING") ||
+		strings.Contains(st, "INVALID") ||
+		strings.Contains(st, "FAILED") ||
+		strings.Contains(st, "ERROR") {
+		return false
+	}
 	if st == "CERTIFICATE_STATUS_TYPE_VALID" ||
 		st == "VALID" ||
 		st == "ACTIVE" ||
 		st == "ISSUED" ||
 		st == "READY" ||
-		st == "TRUE" ||
-		st == "VERIFIED" {
+		st == "TRUE" {
 		return true
 	}
-	return strings.Contains(st, "VALID") && !strings.Contains(st, "VALIDATING") && !strings.Contains(st, "INVALID")
+	return strings.Contains(st, "VALID")
+}
+
+func extractApexDomain(host string) string {
+	clean := cleanHost(host)
+	if clean == "" {
+		return ""
+	}
+	labels := strings.Split(clean, ".")
+	if len(labels) <= 2 {
+		return clean
+	}
+	for _, suffix := range multiPartPublicSuffixes {
+		if strings.HasSuffix(clean, suffix) {
+			suffixParts := strings.Count(suffix, ".")
+			needLabels := suffixParts + 1
+			if len(labels) >= needLabels {
+				return strings.Join(labels[len(labels)-needLabels:], ".")
+			}
+		}
+	}
+	return strings.Join(labels[len(labels)-2:], ".")
+}
+
+func deriveLucityVerifyHost(domain string) string {
+	apex := extractApexDomain(domain)
+	if apex == "" {
+		return ""
+	}
+	return "_lucity-verify." + apex
 }
 
 type LucityClient struct {
@@ -467,7 +524,110 @@ func executeLCGraphQL[T any](ctx context.Context, c *LucityClient, mode lcAuthHe
 	return zero, lastErr
 }
 
+func parseCustomDomainNode(v map[string]any, cleanDom string) LucityCustomDomainInfo {
+	info := LucityCustomDomainInfo{
+		Domain:           cleanDom,
+		CNAMETarget:      defaultLCCNAMETarget,
+		VerificationHost: deriveLucityVerifyHost(cleanDom),
+	}
+
+	if idStr, ok := v["id"].(string); ok {
+		info.ID = strings.TrimSpace(idStr)
+	}
+
+	for _, tKey := range []string{"cnameTarget", "cnameValue", "target", "cname"} {
+		if targetStr, ok := v[tKey].(string); ok && strings.TrimSpace(targetStr) != "" {
+			cleanT := cleanHost(targetStr)
+			if cleanT != "" {
+				info.CNAMETarget = cleanT
+				break
+			}
+		}
+	}
+
+	for _, vhKey := range []string{"verificationHost", "txtName", "txtHost", "verificationDomain", "txtRecordName"} {
+		if vhStr, ok := v[vhKey].(string); ok && strings.TrimSpace(vhStr) != "" {
+			cleanVH := cleanHost(vhStr)
+			if cleanVH != "" {
+				info.VerificationHost = cleanVH
+				break
+			}
+		}
+	}
+
+	for _, vtKey := range []string{"verificationToken", "txtValue", "txtRecord", "verificationValue", "txtRecordValue", "token"} {
+		if vtStr, ok := v[vtKey].(string); ok && strings.TrimSpace(vtStr) != "" {
+			info.VerificationToken = strings.TrimSpace(vtStr)
+			break
+		}
+	}
+
+	if recs, ok := v["dnsRecords"].([]any); ok {
+		for _, item := range recs {
+			rm, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			rType, _ := rm["type"].(string)
+			rName, _ := rm["name"].(string)
+			rVal, _ := rm["value"].(string)
+			if rVal == "" {
+				rVal, _ = rm["content"].(string)
+			}
+			switch strings.ToUpper(strings.TrimSpace(rType)) {
+			case "TXT":
+				if cleanHost(rName) != "" {
+					info.VerificationHost = cleanHost(rName)
+				}
+				if strings.TrimSpace(rVal) != "" {
+					info.VerificationToken = strings.TrimSpace(rVal)
+				}
+			case "CNAME":
+				if cleanHost(rVal) != "" {
+					info.CNAMETarget = cleanHost(rVal)
+				}
+			}
+		}
+	}
+
+	var tlsState string
+	for _, k := range []string{"tlsStatus", "certificateStatus", "sslStatus", "certStatus"} {
+		if s, ok := v[k].(string); ok && strings.TrimSpace(s) != "" {
+			tlsState = strings.TrimSpace(s)
+			break
+		}
+	}
+	if tlsState == "" {
+		if tlsReady, ok := v["tlsReady"].(bool); ok {
+			if tlsReady {
+				tlsState = "VALID"
+			} else {
+				tlsState = "PROVISIONING"
+			}
+		} else if readyBool, ok := v["ready"].(bool); ok && readyBool {
+			tlsState = "VALID"
+		} else if stStr, ok := v["status"].(string); ok && strings.TrimSpace(stStr) != "" {
+			upperSt := strings.ToUpper(strings.TrimSpace(stStr))
+			if upperSt != "VERIFIED" && upperSt != "DNS_VERIFIED" {
+				tlsState = strings.TrimSpace(stStr)
+			}
+		}
+	}
+	info.CertificateStatus = tlsState
+
+	if dnsSt, ok := v["dnsStatus"].(string); ok {
+		u := strings.ToUpper(strings.TrimSpace(dnsSt))
+		if u == "VERIFIED" || u == "VALID" || u == "ACTIVE" || u == "OK" {
+			info.RecordsVerified = true
+		}
+	}
+
+	return info
+}
+
 func extractDomainsFromGenericMap(raw any) (serviceDom string, customDoms []LucityCustomDomainInfo) {
+	seenCustom := make(map[string]int)
+
 	var walk func(node any)
 	walk = func(node any) {
 		switch v := node.(type) {
@@ -477,32 +637,27 @@ func extractDomainsFromGenericMap(raw any) (serviceDom string, customDoms []Luci
 				if strVal, ok := val.(string); ok {
 					clean := cleanHost(strVal)
 					if isLucityPublicDomain(clean) {
-						if serviceDom == "" || isFullLucityServiceDomain(clean) {
+						if !isLucityCnameAlias(clean) && (serviceDom == "" || isFullLucityServiceDomain(clean)) {
 							serviceDom = clean
 						}
 					} else if (lowerKey == "domain" || lowerKey == "hostname" || lowerKey == "host" || lowerKey == "customdomain") &&
-						clean != "" && strings.Contains(clean, ".") && !isLucityManagedDomain(clean) {
-						info := LucityCustomDomainInfo{
-							Domain: clean,
+						clean != "" && strings.Contains(clean, ".") && !isLucityManagedDomain(clean) && !strings.HasPrefix(clean, "_lucity-verify.") {
+						parsed := parseCustomDomainNode(v, clean)
+						if idx, exists := seenCustom[clean]; exists {
+							existing := &customDoms[idx]
+							if existing.ID == "" && parsed.ID != "" {
+								existing.ID = parsed.ID
+							}
+							if existing.VerificationToken == "" && parsed.VerificationToken != "" {
+								existing.VerificationToken = parsed.VerificationToken
+							}
+							if existing.CertificateStatus == "" && parsed.CertificateStatus != "" {
+								existing.CertificateStatus = parsed.CertificateStatus
+							}
+						} else {
+							seenCustom[clean] = len(customDoms)
+							customDoms = append(customDoms, parsed)
 						}
-						if idStr, ok := v["id"].(string); ok {
-							info.ID = idStr
-						}
-						if stStr, ok := v["status"].(string); ok {
-							info.CertificateStatus = stStr
-						} else if stStr, ok := v["certificateStatus"].(string); ok {
-							info.CertificateStatus = stStr
-						} else if readyBool, ok := v["ready"].(bool); ok && readyBool {
-							info.CertificateStatus = "VALID"
-						} else if tlsReady, ok := v["tlsReady"].(bool); ok && tlsReady {
-							info.CertificateStatus = "VALID"
-						}
-						if targetStr, ok := v["cnameTarget"].(string); ok && targetStr != "" {
-							info.CNAMETarget = cleanHost(targetStr)
-						} else if targetStr, ok := v["target"].(string); ok && targetStr != "" {
-							info.CNAMETarget = cleanHost(targetStr)
-						}
-						customDoms = append(customDoms, info)
 					}
 				} else {
 					walk(val)
@@ -515,14 +670,21 @@ func extractDomainsFromGenericMap(raw any) (serviceDom string, customDoms []Luci
 		}
 	}
 	walk(raw)
-	if serviceDom != "" {
-		for i := range customDoms {
-			if customDoms[i].CNAMETarget == "" {
-				customDoms[i].CNAMETarget = serviceDom
-			}
+
+	for i := range customDoms {
+		if customDoms[i].CNAMETarget == "" {
+			customDoms[i].CNAMETarget = defaultLCCNAMETarget
+		}
+		if customDoms[i].VerificationHost == "" {
+			customDoms[i].VerificationHost = deriveLucityVerifyHost(customDoms[i].Domain)
 		}
 	}
 	return serviceDom, customDoms
+}
+
+func isLucityCnameAlias(h string) bool {
+	h = cleanHost(h)
+	return h == "lb.lucity.app" || h == "lb.lucity.cloud"
 }
 
 func extractServiceIDFromGenericMap(raw any, preferredDomain string) (wsID, projID, envID, svcID, discoveredServiceDom string) {
@@ -788,8 +950,45 @@ func (c *LucityClient) fetchServiceDetails(ctx context.Context) (string, []Lucit
 					id
 					domain
 					cnameTarget
+					verificationHost
+					verificationToken
+					txtName
+					txtValue
+					dnsStatus
+					tlsStatus
+					certificateStatus
 					status
 					ready
+				}
+			}
+		}`,
+		`query service($id: ID!) {
+			service(id: $id) {
+				id
+				name
+				domain
+				customDomains {
+					id
+					domain
+					cnameTarget
+					status
+					ready
+				}
+			}
+		}`,
+		`query service($id: ID!) {
+			service(id: $id) {
+				id
+				name
+				domain
+				domains {
+					id
+					domain
+					cnameTarget
+					verificationToken
+					dnsStatus
+					tlsStatus
+					status
 				}
 			}
 		}`,
@@ -916,14 +1115,25 @@ func probeCustomDomainTLS(ctx context.Context, customDomain, gatewayHost string)
 	if cleanCustom == "" {
 		return false
 	}
-	dialTarget := cleanHost(gatewayHost)
-	if dialTarget == "" {
-		dialTarget = cleanCustom
+
+	// Always dial Lucity's ingress load balancer directly (lb.lucity.app) rather than
+	// cleanCustom so Cloudflare's Universal Edge SSL never causes a false-positive match
+	// before Lucity's own Let's Encrypt HTTP-01 certificate is issued.
+	dialTarget := defaultLCCNAMETarget
+	cleanGW := cleanHost(gatewayHost)
+	if cleanGW != "" && isLucityPublicDomain(cleanGW) {
+		dialTarget = defaultLCCNAMETarget
 	}
 
 	dialer := &net.Dialer{
 		Timeout: defaultLCTLSProbeTimeout,
 	}
+	if dl, ok := ctx.Deadline(); ok {
+		if rem := time.Until(dl); rem > 0 && rem < dialer.Timeout {
+			dialer.Timeout = rem
+		}
+	}
+
 	tlsConn, err := tls.DialWithDialer(dialer, "tcp", net.JoinHostPort(dialTarget, "443"), &tls.Config{
 		ServerName:         cleanCustom,
 		MinVersion:         tls.VersionTLS12,
@@ -942,31 +1152,26 @@ func (c *LucityClient) EnsureCustomDomain(ctx context.Context, targetDomain stri
 		return nil, errors.New("invalid or empty custom domain target")
 	}
 
-	sDom, existingDoms, _ := c.fetchServiceDetails(ctx)
-	if sDom == "" {
-		sDom = c.GetServiceDomain()
-	}
+	_, existingDoms, _ := c.fetchServiceDetails(ctx)
 
 	for i := range existingDoms {
 		cd := &existingDoms[i]
 		if cleanHost(cd.Domain) == cleanTarget {
 			c.SetCustomDomain(cleanTarget)
 			c.notifyTopology()
-			if cd.CNAMETarget == "" {
-				if sDom != "" {
-					cd.CNAMETarget = sDom
-				} else {
-					cd.CNAMETarget = "lb.lucity.app"
-				}
+			if cd.CNAMETarget == "" || isFullLucityServiceDomain(cd.CNAMETarget) {
+				cd.CNAMETarget = defaultLCCNAMETarget
 			}
 			if cd.VerificationHost == "" {
-				cd.VerificationHost = "_lucity-verify." + cleanTarget
+				cd.VerificationHost = deriveLucityVerifyHost(cleanTarget)
 			}
-			if !cd.IsCertificateValid() && probeCustomDomainTLS(ctx, cleanTarget, cd.CNAMETarget) {
+			if probeCustomDomainTLS(ctx, cleanTarget, cd.CNAMETarget) {
 				cd.CertificateStatus = "VALID"
+			} else if cd.IsCertificateValid() {
+				cd.CertificateStatus = "PROVISIONING"
 			}
-			log.Printf("[Lucity] ✓ Custom Domain Already Registered: %s (CNAME Target: %s, CertStatus: %s)",
-				cleanTarget, cd.CNAMETarget, cd.CertificateStatus)
+			log.Printf("[Lucity] ✓ Custom Domain Already Registered: %s (CNAME Target: %s, VerifyHost: %s, CertStatus: %s)",
+				cleanTarget, cd.CNAMETarget, cd.VerificationHost, cd.CertificateStatus)
 			return cd, nil
 		}
 	}
@@ -989,6 +1194,12 @@ func (c *LucityClient) EnsureCustomDomain(ctx context.Context, targetDomain stri
 						id
 						domain
 						cnameTarget
+						verificationHost
+						verificationToken
+						txtName
+						txtValue
+						dnsStatus
+						tlsStatus
 						status
 					}
 				}`,
@@ -998,6 +1209,38 @@ func (c *LucityClient) EnsureCustomDomain(ctx context.Context, targetDomain stri
 						"domain":    cleanTarget,
 						"port":      port,
 					},
+				},
+			},
+			{
+				query: `mutation addCustomDomain($input: AddCustomDomainInput!) {
+					addCustomDomain(input: $input) {
+						id
+						domain
+						cnameTarget
+						status
+					}
+				}`,
+				vars: map[string]any{
+					"input": map[string]any{
+						"serviceId": svcID,
+						"domain":    cleanTarget,
+						"port":      port,
+					},
+				},
+			},
+			{
+				query: `mutation addDomain($serviceId: ID!, $domain: String!) {
+					addDomain(serviceId: $serviceId, domain: $domain) {
+						id
+						domain
+						cnameTarget
+						verificationToken
+						status
+					}
+				}`,
+				vars: map[string]any{
+					"serviceId": svcID,
+					"domain":    cleanTarget,
 				},
 			},
 			{
@@ -1039,45 +1282,38 @@ func (c *LucityClient) EnsureCustomDomain(ctx context.Context, targetDomain stri
 			_, createdDoms := extractDomainsFromGenericMap(raw)
 			if len(createdDoms) > 0 {
 				info := createdDoms[0]
-				if info.CNAMETarget == "" {
-					if c.GetServiceDomain() != "" {
-						info.CNAMETarget = c.GetServiceDomain()
-					} else {
-						info.CNAMETarget = "lb.lucity.app"
-					}
+				if info.CNAMETarget == "" || isFullLucityServiceDomain(info.CNAMETarget) {
+					info.CNAMETarget = defaultLCCNAMETarget
 				}
 				if info.VerificationHost == "" {
-					info.VerificationHost = "_lucity-verify." + cleanTarget
+					info.VerificationHost = deriveLucityVerifyHost(cleanTarget)
+				}
+				if probeCustomDomainTLS(ctx, cleanTarget, info.CNAMETarget) {
+					info.CertificateStatus = "VALID"
+				} else if info.IsCertificateValid() {
+					info.CertificateStatus = "PROVISIONING"
 				}
 				c.SetCustomDomain(cleanTarget)
 				c.notifyTopology()
-				log.Printf("[Lucity] ✓ Auto-Registered Custom Domain on Port %d: %s -> CNAME Target: %s",
-					port, cleanTarget, info.CNAMETarget)
+				log.Printf("[Lucity] ✓ Auto-Registered Custom Domain on Port %d: %s -> CNAME Target: %s (VerifyHost: %s)",
+					port, cleanTarget, info.CNAMETarget, info.VerificationHost)
 				return &info, nil
 			}
 		}
-	}
-
-	fallbackTarget := c.GetServiceDomain()
-	if fallbackTarget == "" {
-		fallbackTarget = sDom
-	}
-	if fallbackTarget == "" {
-		fallbackTarget = "lb.lucity.app"
 	}
 
 	c.SetCustomDomain(cleanTarget)
 	c.notifyTopology()
 
 	certState := "PENDING_HTTP01"
-	if probeCustomDomainTLS(ctx, cleanTarget, fallbackTarget) {
+	if probeCustomDomainTLS(ctx, cleanTarget, defaultLCCNAMETarget) {
 		certState = "VALID"
 	}
 
 	info := &LucityCustomDomainInfo{
 		Domain:            cleanTarget,
-		CNAMETarget:       fallbackTarget,
-		VerificationHost:  "_lucity-verify." + cleanTarget,
+		CNAMETarget:       defaultLCCNAMETarget,
+		VerificationHost:  deriveLucityVerifyHost(cleanTarget),
 		CertificateStatus: certState,
 	}
 	return info, nil
@@ -1085,36 +1321,32 @@ func (c *LucityClient) EnsureCustomDomain(ctx context.Context, targetDomain stri
 
 func (c *LucityClient) FetchCustomDomainStatus(ctx context.Context, customDomainID, targetDomain string) (*LucityCustomDomainInfo, error) {
 	cleanTarget := cleanHost(targetDomain)
-	sDom, customDoms, _ := c.fetchServiceDetails(ctx)
-	if sDom == "" {
-		sDom = c.GetServiceDomain()
-	}
-	if sDom == "" {
-		sDom = "lb.lucity.app"
-	}
+	_, customDoms, _ := c.fetchServiceDetails(ctx)
 
 	for i := range customDoms {
 		cd := &customDoms[i]
 		if (customDomainID != "" && cd.ID == customDomainID) || (cleanTarget != "" && cleanHost(cd.Domain) == cleanTarget) {
-			if cd.CNAMETarget == "" {
-				cd.CNAMETarget = sDom
+			if cd.CNAMETarget == "" || isFullLucityServiceDomain(cd.CNAMETarget) {
+				cd.CNAMETarget = defaultLCCNAMETarget
 			}
 			if cd.VerificationHost == "" {
-				cd.VerificationHost = "_lucity-verify." + cleanTarget
+				cd.VerificationHost = deriveLucityVerifyHost(cleanTarget)
 			}
-			if !cd.IsCertificateValid() && probeCustomDomainTLS(ctx, cleanTarget, cd.CNAMETarget) {
+			if probeCustomDomainTLS(ctx, cleanTarget, cd.CNAMETarget) {
 				cd.CertificateStatus = "VALID"
+			} else if cd.IsCertificateValid() {
+				cd.CertificateStatus = "PROVISIONING"
 			}
 			return cd, nil
 		}
 	}
 
-	if probeCustomDomainTLS(ctx, cleanTarget, sDom) {
+	if probeCustomDomainTLS(ctx, cleanTarget, defaultLCCNAMETarget) {
 		return &LucityCustomDomainInfo{
 			ID:                customDomainID,
 			Domain:            cleanTarget,
-			CNAMETarget:       sDom,
-			VerificationHost:  "_lucity-verify." + cleanTarget,
+			CNAMETarget:       defaultLCCNAMETarget,
+			VerificationHost:  deriveLucityVerifyHost(cleanTarget),
 			CertificateStatus: "VALID",
 			RecordsVerified:   true,
 		}, nil
@@ -1123,8 +1355,8 @@ func (c *LucityClient) FetchCustomDomainStatus(ctx context.Context, customDomain
 	return &LucityCustomDomainInfo{
 		ID:                customDomainID,
 		Domain:            cleanTarget,
-		CNAMETarget:       sDom,
-		VerificationHost:  "_lucity-verify." + cleanTarget,
+		CNAMETarget:       defaultLCCNAMETarget,
+		VerificationHost:  deriveLucityVerifyHost(cleanTarget),
 		CertificateStatus: "PENDING_HTTP01",
 	}, nil
 }
@@ -1188,6 +1420,11 @@ func (c *LucityClient) TuneComputeAndNetwork(ctx context.Context) {
 	c.mu.RUnlock()
 
 	healthPath := getEnv("BERMUDA_HEALTH_PATH", "/.well-known/hc-5b1e7c")
+
+	if !strings.EqualFold(getEnv("BERMUDA_LUCITY_SYNC_HEALTHCHECK", "false"), "true") {
+		log.Printf("[Lucity] ✓ Compute & Network Verified: Service=%s | Port=%d | HealthPath=%s", svcID, port, healthPath)
+		return
+	}
 
 	const updateNetworkingMutation = `mutation updateServiceNetworking($input: UpdateServiceInput!) {
 		updateService(input: $input) { id }
